@@ -43,5 +43,5 @@
   - ### Flutter로 개발한 모바일 앱을 WebSocket으로 로봇 환경과 연동하여 원격 제어 및 상태 모니터링 지원
   - ### ROS2와 SLAM을 기반으로 Camera, LiDAR가 장착된 TurtleBot이 장애물을 회피하며 최적 경로를 탐색하는 자율주행 시스템 구성
   
-/## Project Outcome
-/- ### 20XX 년 OO학술대회 
+//## Project Outcome
+//- ### 20XX 년 OO학술대회 
