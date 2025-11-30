@@ -1,0 +1,25 @@
+environment:
+  sdk: ^3.8.1
+  
+dependencies:
+  flutter:
+    sdk: flutter
+
+  flutter_joystick: ^0.2.2
+  mjpeg_stream: ^1.0.1
+  image: ^4.0.17
+  web_socket_channel: ^2.4.0
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_launcher_icons: ^0.13.1
+
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/roboticon.png"
+
+  flutter_lints: ^5.0.0

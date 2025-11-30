@@ -1,0 +1,573 @@
+import 'package:flutter/material.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:flutter_joystick/flutter_joystick.dart';
+// import 'package:mjpeg_stream/mjpeg_stream.dart';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'dart:math';
+import 'dart:ui' as ui;
+import 'package:image/image.dart' as img;
+
+void main() => runApp(MyApp());
+
+class MyApp extends StatelessWidget { //앱 이름,
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'ROS2 Mobile',
+      home: HomePage(),
+      routes: {
+        '/mapView': (_) => MapViewPage(),
+        '/camView': (_) => CameraViewPage(),
+      },
+    );
+  }
+}
+class HomePage extends StatelessWidget { //메인 페이지
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Home'),
+        leading: Icon(Icons.arrow_back), // 필요 시 뒤로가기 처리
+      ),
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                minimumSize: Size(200, 70), // 최소 크기 지정
+              ),
+
+              child: Text('2D view'),
+              onPressed: () => Navigator.pushNamed(context, '/mapView'),
+            ),
+            SizedBox(height: 20),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                minimumSize: Size(200, 70), // 최소 크기 지정
+              ),
+
+              child: Text('Camera view'),
+              onPressed: () => Navigator.pushNamed(context, '/camView'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+enum ControlViewMode { joystick, poses }
+
+class MapViewPage extends StatefulWidget {
+  @override
+  MapViewPageState createState() => MapViewPageState();
+}
+
+class MapViewPageState extends State<MapViewPage> {
+  ui.Image? slamMap;
+  double linearSpeed = 0.0, angularSpeed = 0.0;
+
+  Offset robotPosition = Offset.zero;
+  double robotTheta = 0.0;
+  List<Offset> lidarPoints = [];
+  double mapResolution = 0.05;
+  Offset mapOrigin = Offset.zero;
+
+  Offset? goalPosition;
+  List<Offset> globalPath = [];
+
+  final channel = WebSocketChannel.connect(Uri.parse('ws://192.168.0.5:9090')); //IP 주소 수정
+
+  ControlViewMode _controlViewMode = ControlViewMode.joystick;
+
+  @override
+  void initState() {
+    super.initState();
+
+    channel.sink.add('{"op":"subscribe", "topic":"/map"}');
+    channel.sink.add('{"op":"subscribe", "topic":"/amcl_pose"}');
+    channel.sink.add('{"op":"subscribe", "topic":"/scan"}');
+    channel.sink.add('{"op":"subscribe", "topic":"/plan", "type":"nav_msgs/msg/Path"}');
+
+    channel.stream.listen((message) async {
+      final data = json.decode(message);
+      final topic = data['topic'];
+
+      if (topic == '/map') {
+        final msg = data['msg'];
+        mapResolution = msg['info']['resolution'];
+        mapOrigin = Offset(
+          msg['info']['origin']['position']['x'].toDouble(),
+          msg['info']['origin']['position']['y'].toDouble(),
+        );
+        final imageBytes = occupancyGridToImageBytes(msg);
+        final codec = await ui.instantiateImageCodec(imageBytes);
+        final frame = await codec.getNextFrame();
+        setState(() {
+          slamMap = frame.image;
+        });
+      } else if (topic == '/amcl_pose') {
+        final pose = data['msg']['pose']['pose'];
+        final x = pose['position']['x'].toDouble();
+        final y = pose['position']['y'].toDouble();
+        final qz = pose['orientation']['z'].toDouble();
+        final qw = pose['orientation']['w'].toDouble();
+        final theta = 2 * atan2(qz, qw);
+        setState(() {
+          robotPosition = mapToCanvas(x, y);
+          robotTheta = theta;
+        });
+      } else if (topic == '/scan') {
+        final msg = data['msg'];
+        final angleMin = msg['angle_min'].toDouble();
+        final angleInc = msg['angle_increment'].toDouble();
+        final ranges = List<double>.from(msg['ranges']);
+        List<Offset> points = [];
+        for (int i = 0; i < ranges.length; i++) {
+          final r = ranges[i];
+          if (r.isNaN || r.isInfinite || r > 10) continue;
+          final angle = angleMin + i * angleInc;
+          final px = robotPosition.dx + (r / mapResolution) * cos(robotTheta + angle);
+          final py = robotPosition.dy - (r / mapResolution) * sin(robotTheta + angle);
+          points.add(Offset(px, py));
+        }
+        setState(() {
+          lidarPoints = points;
+        });
+      } else if (topic == '/plan'){
+        final msg = data['msg'];
+        final poses = List<Map<String, dynamic>>.from(msg['poses']);
+        List<Offset> points = [];
+        for (var poseStamped in poses) {
+          final pose = poseStamped['pose'];
+          final x = pose['position']['x'].toDouble();
+          final y = pose['position']['y'].toDouble();
+          points.add(mapToCanvas(x, y));
+        }
+        setState(() {
+          globalPath = points;
+        });
+      }
+    });
+  }
+
+  Uint8List occupancyGridToImageBytes(Map<String, dynamic> og) {
+    int width = og["info"]["width"];
+    int height = og["info"]["height"];
+    List<int> data = List<int>.from(og["data"]);
+    final image = img.Image(width: width, height: height);
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        int val = data[y * width + x];
+        int gray = (val == 100) ? 0 : (val == 0) ? 255 : 127;
+        image.setPixelRgba(x, height - y - 1, gray, gray, gray, 255);
+      }
+    }
+    return Uint8List.fromList(img.encodePng(image));
+  }
+
+  Offset mapToCanvas(double x, double y) {
+    final dx = (x - mapOrigin.dx) / mapResolution;
+    final dy = (y - mapOrigin.dy) / mapResolution;
+    return Offset(dx, (slamMap?.height.toDouble() ?? 0) - dy);
+  }
+
+  @override
+  void dispose() {
+    channel.sink.close();
+    super.dispose();
+  }
+
+  void _publishVelocity(double linear, double angular) {
+    setState(() {
+      linearSpeed = linear;
+      angularSpeed = angular;
+    });
+
+    String twistCmd = '{"op":"publish","topic":"/cmd_vel","msg":{"linear":{"x": $linearSpeed},"angular":{"z": $angularSpeed}}}';
+    channel.sink.add(twistCmd);
+  }
+
+  void onJoystickChange(StickDragDetails details) {
+    _publishVelocity(-details.y, -details.x);
+  }
+
+  void sendGoalPose(double x, double y, double yaw) {
+    final qz = sin(yaw / 2);
+    final qw = cos(yaw / 2);
+    final goalMsg = {
+      "op": "publish",
+      "topic": "/goal_pose",
+      "msg": {
+        "header": {"frame_id": "map", "stamp": {"sec": 0, "nanosec": 0}},
+        "pose": {
+          "position": {"x": x, "y": y, "z": 0.0},
+          "orientation": {"x": 0.0, "y": 0.0, "z": qz, "w": qw}
+        }
+      }
+    };
+    channel.sink.add(json.encode(goalMsg));
+  }
+
+  // 조이스틱
+  Widget _buildJoystickControls() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8.0),
+          child: Column(
+            children: [
+              Text('Linear : ${linearSpeed.toStringAsFixed(2)} m/s'),
+              Text('Angular: ${angularSpeed.toStringAsFixed(2)} rad/s'),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 60.0, top: 10.0),
+          child: Joystick(
+            listener: onJoystickChange,
+            mode: JoystickMode.all,
+            stickOffsetCalculator: CircleStickOffsetCalculator(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // 버튼
+  Widget _buildPoseButtonControls() {
+    return Padding(
+      padding: const EdgeInsets.only(top: 20.0, bottom: 100.0, left: 30.0, right: 30.0), //EdgeInsets.symmetric(vertical: 20.0, horizontal: 30.0),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _buildPoseButton('save1', '/save_pose', 'point1'),
+              _buildPoseButton('save2', '/save_pose', 'point2'),
+            ],
+          ),
+          SizedBox(height: 15),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _buildPoseButton('move1', '/goto_pose', 'point1'),
+              _buildPoseButton('move2', '/goto_pose', 'point2'),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // 버튼 헬퍼
+  Widget _buildPoseButton(String text, String topic, String data) {
+    return ElevatedButton(
+      style: ElevatedButton.styleFrom(
+        minimumSize: Size(130, 60),
+        textStyle: TextStyle(fontSize: 16),
+      ),
+      child: Text(text),
+      onPressed: () {
+        final poseMsg = {
+          "op": "publish",
+          "topic": topic,
+          "msg": {
+            "data": data
+          },
+          "type": "std_msgs/msg/String"
+        };
+
+        channel.sink.add(json.encode(poseMsg));
+
+        String feedbackMessage;
+        if (data == 'save1' || data == 'save2') {feedbackMessage = "위치를 저장합니다.";}
+        else if (data == 'goto1' || data == 'goto2') {feedbackMessage = "저장된 위치로 이동합니다.";}
+        else {feedbackMessage = "명령을 전송했습니다.";}
+
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(feedbackMessage),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      },
+    );
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('2D view'), leading: BackButton()),
+      body: Column(
+        children: [
+          Expanded(
+            child: slamMap == null
+                ? Center(child: Text('Waiting for map...'))
+                : LayoutBuilder(
+              builder: (context, constraints) {
+                final canvasSize = constraints.biggest;
+                return GestureDetector(
+                  onTapUp: (details) {
+                    if (slamMap == null) return;
+                    final tapPosition = details.localPosition;
+                    final double scaleX = canvasSize.width / slamMap!.width;
+                    final double scaleY = canvasSize.height / slamMap!.height;
+                    final double scale = min(scaleX, scaleY);
+                    final double offsetX = (canvasSize.width - slamMap!.width * scale) / 2;
+                    final double offsetY = (canvasSize.height - slamMap!.height * scale) / 2;
+                    final mapImagePixelX = (tapPosition.dx - offsetX) / scale;
+                    final mapImagePixelY = (tapPosition.dy - offsetY) / scale;
+                    if (mapImagePixelX < 0 ||
+                        mapImagePixelX >= slamMap!.width ||
+                        mapImagePixelY < 0 ||
+                        mapImagePixelY >= slamMap!.height) {
+                      return;
+                    }
+                    setState(() {
+                      goalPosition = Offset(mapImagePixelX, mapImagePixelY);
+                      globalPath = [];
+                    });
+                    final mapImagePixelY_ROS = slamMap!.height - mapImagePixelY;
+                    final mapX = (mapImagePixelX * mapResolution) + mapOrigin.dx;
+                    final mapY = (mapImagePixelY_ROS * mapResolution) + mapOrigin.dy;
+                    sendGoalPose(mapX, mapY, 0.0);
+                  },
+                  child: CustomPaint(
+                    painter: SLAMPainter(slamMap!, robotPosition, robotTheta, lidarPoints, goalPosition, globalPath),
+                    size: Size.infinite,
+                  ),
+                );
+              },
+            ),
+          ),
+
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8.0),
+            child: SegmentedButton<ControlViewMode>(
+              segments: const [
+                ButtonSegment(
+                  value: ControlViewMode.joystick,
+                  label: Text('Joystick'),
+                  icon: Icon(Icons.gamepad),
+                ),
+                ButtonSegment(
+                  value: ControlViewMode.poses,
+                  label: Text('Save Point'),
+                  icon: Icon(Icons.bookmark_add),
+                ),
+              ],
+              selected: {_controlViewMode},
+              onSelectionChanged: (Set<ControlViewMode> newSelection) {
+                setState(() {
+                  _controlViewMode = newSelection.first;
+                  if (_controlViewMode == ControlViewMode.poses) {
+                    _publishVelocity(0.0, 0.0);
+                  }
+                });
+              },
+              style: SegmentedButton.styleFrom(
+                backgroundColor: Colors.grey.shade200,
+                selectedBackgroundColor: Colors.blue.shade100,
+                selectedForegroundColor: Colors.blue.shade900,
+              ),
+            ),
+          ),
+
+          if (_controlViewMode == ControlViewMode.joystick)
+            _buildJoystickControls()
+          else
+            _buildPoseButtonControls(),
+        ],
+      ),
+    );
+  }
+}
+
+class SLAMPainter extends CustomPainter {
+  final ui.Image mapImage;
+  final Offset robotPos;
+  final double robotTheta;
+  final List<Offset> lidarPts;
+  final Offset? goalPos;
+  final List<Offset> pathPts;
+
+  SLAMPainter(this.mapImage, this.robotPos, this.robotTheta, this.lidarPts, this.goalPos, this.pathPts);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final double scaleX = size.width / mapImage.width;
+    final double scaleY = size.height / mapImage.height;
+    final double scale = min(scaleX, scaleY);
+
+    canvas.save();
+    final double dx = (size.width - mapImage.width * scale) / 2;
+    final double dy = (size.height - mapImage.height * scale) / 2;
+    canvas.translate(dx, dy);
+    canvas.scale(scale, scale);
+
+    final paint = Paint();
+
+    canvas.drawImage(mapImage, Offset.zero, paint);
+
+    if (pathPts.isNotEmpty) {
+      final pathPaint = Paint()
+        ..color = Colors.red
+        ..strokeWidth = 2.0 / scale
+        ..style = PaintingStyle.stroke;
+      final path = Path();
+      path.moveTo(pathPts.first.dx, pathPts.first.dy);
+      for (int i = 1; i < pathPts.length; i++) {
+        path.lineTo(pathPts[i].dx, pathPts[i].dy);
+      }
+      canvas.drawPath(path, pathPaint);
+    }
+
+    if (goalPos != null) {
+      final goalPaint = Paint()..color = Colors.blue.withOpacity(0.9);
+      final double markerBaseSize = 15.0 / scale;
+      final Path markerPath = Path();
+
+      markerPath.moveTo(goalPos!.dx, goalPos!.dy);
+      markerPath.quadraticBezierTo(
+          goalPos!.dx - (markerBaseSize * 0.8),
+          goalPos!.dy - (markerBaseSize * 0.8),
+          goalPos!.dx,
+          goalPos!.dy - (markerBaseSize * 1.6)
+      );
+      markerPath.quadraticBezierTo(
+          goalPos!.dx + (markerBaseSize * 0.8),
+          goalPos!.dy - (markerBaseSize * 0.8),
+          goalPos!.dx,
+          goalPos!.dy
+      );
+      markerPath.close();
+      canvas.drawPath(markerPath, goalPaint);
+    }
+
+    final robotPaint = Paint()..color = Colors.blue;
+    const double triSize = 5.0;
+    final p1 = Offset(robotPos.dx + triSize * cos(robotTheta), robotPos.dy - triSize * sin(robotTheta));
+    final p2 = Offset(robotPos.dx + triSize * cos(robotTheta + 2.5), robotPos.dy - triSize * sin(robotTheta + 2.5));
+    final p3 = Offset(robotPos.dx + triSize * cos(robotTheta - 2.5), robotPos.dy - triSize * sin(robotTheta - 2.5));
+    final path = Path()..moveTo(p1.dx, p1.dy)..lineTo(p2.dx, p2.dy)..lineTo(p3.dx, p3.dy)..close();
+    canvas.drawPath(path, robotPaint);
+
+    final lidarPaint = Paint()..color = Colors.orange.withOpacity(0.7)..strokeWidth = 1;
+    for (final pt in lidarPts) {
+      canvas.drawCircle(pt, 1.5, lidarPaint);
+    }
+    canvas.restore();
+  }
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
+class CameraViewPage extends StatefulWidget {
+  @override
+  CameraViewPageState createState() => CameraViewPageState();
+}
+
+class CameraViewPageState extends State<CameraViewPage> {
+  double linearSpeed = 0.0, angularSpeed = 0.0;
+  Uint8List? _cameraImageBytes;
+
+  final channel = WebSocketChannel.connect(Uri.parse('ws://192.168.0.5:9090')); //'ws://127.168.xxx.xxx:9090'
+
+  @override
+  void initState() {
+    super.initState();
+
+    channel.sink.add('{"op":"subscribe", "topic":"/camera/image_compressed", "type":"sensor_msgs/msg/CompressedImage"}');
+
+    channel.stream.listen((message) {
+      try {
+        final data = json.decode(message);
+        final topic = data['topic'];
+
+        if (topic == '/camera/image_compressed') {
+          final imageData = data['msg']['data'];
+          if (imageData is String) {
+            setState(() {
+              _cameraImageBytes = base64Decode(imageData);
+            });
+          }
+        }
+      } catch (e) {
+        print('Error processing camera message: $e');
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    channel.sink.close();
+    super.dispose();
+  }
+
+  void onJoystickChange(StickDragDetails details) {
+    setState(() {
+      linearSpeed = -details.y;
+      angularSpeed = -details.x;
+    });
+
+    final twistCmd = '''
+    {
+      "op": "publish",
+      "topic": "/cmd_vel",
+      "msg": {
+        "linear": { "x": $linearSpeed },
+        "angular": { "z": $angularSpeed }
+      }
+    }
+    ''';
+    channel.sink.add(twistCmd);
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+      return Scaffold(
+        appBar: AppBar(title: Text('Camera view'), leading: BackButton()),
+        body: Column(
+          children: [
+            Expanded(
+              child: Center(
+                child: _cameraImageBytes == null
+                    ? const Text('Waiting for Camera Data...')
+                    : Image.memory(
+                  _cameraImageBytes!, // Image.memory 위젯 사용
+                  fit: BoxFit.contain,
+                  gaplessPlayback: true, // 깜빡임 줄이기
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8.0),
+              child: Column(
+                children: [
+                  Text('Linear : ${linearSpeed.toStringAsFixed(2)} m/s'),
+                  Text('Angular: ${angularSpeed.toStringAsFixed(2)} rad/s'),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 60.0),
+              child: Joystick(
+                listener: onJoystickChange,
+                mode: JoystickMode.all,
+                stickOffsetCalculator: CircleStickOffsetCalculator(),
+              ),
+            ),
+          ],
+        ),
+      );
+  }
+}
