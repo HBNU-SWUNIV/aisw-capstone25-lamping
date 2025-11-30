@@ -1,0 +1,6 @@
+<library path="virtual_obstacle_layer">
+	<class name="virtual_layer::VirtualLayer" type="virtual_layer::VirtualLayer"
+		base_class_type="nav2_costmap_2d::Layer">
+		<description>Virtual obstacle layer from OccupancyGrid</description>
+	</class>
+</library>
